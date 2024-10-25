@@ -4,7 +4,7 @@ import * as path from 'path';
 
 let panel: vscode.WebviewPanel | undefined;
 let messageListenerDisposable: vscode.Disposable | undefined;
-let cacheFunctionsData: Map<string, { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number }[]> = new Map();
+let cacheFunctionsData: Map<string, { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number}[]> = new Map();
 
 export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
@@ -25,7 +25,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('extension.showFunctionListWebview', async (documentUri: vscode.Uri, functionToReplaceNameRange: vscode.Range, type: string, functionToReplaceName: string, needFilter: boolean) => {
-            let foundFunctionsData: { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number}[] = [];
+            let foundFunctionsData: { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number}[] = [];
             if (!cacheFunctionsData.has(type)) {
                 const documents = await openPythonDocuments();
                 foundFunctionsData = await getFunctionsData(documents, type);
@@ -77,6 +77,20 @@ export function activate(context: vscode.ExtensionContext) {
                             const functionToReplaceRange = currentFileFunctionsData.find(f => rangesAreEqual(f.nameRange, functionToReplaceNameRange))?.functionRange;
                             await replaceFunction(document, functionToReplaceRange, selectedFunction.fullFunction);
                         }
+                    } else if (message.command === 'openFile') {
+                        // Открытие файла и прокрутка до указанной строки и символа
+                        const fileUri = vscode.Uri.file(message.filePath);
+                        const document = await vscode.workspace.openTextDocument(fileUri);
+                        const editor = await vscode.window.showTextDocument(document);
+
+                        // Используем точную позицию строки и символа
+                        const position = new vscode.Position(message.line, message.character);
+
+                        // Устанавливаем курсор на нужную позицию
+                        editor.selection = new vscode.Selection(position, position);
+
+                        // Прокручиваем до позиции, если она не видна
+                        editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
                     }
                 },
                 undefined,
@@ -122,8 +136,8 @@ class FunctionCodeLensProvider implements vscode.CodeLensProvider {
     }
 }
 
-async function getFunctionsData(documents: vscode.TextDocument[], type: string, filterName: string = ""): Promise<{ name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number}[]> {
-    const functionsMap: Map<string, { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number }> = new Map();
+async function getFunctionsData(documents: vscode.TextDocument[], type: string, filterName: string = ""): Promise<{ name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number}[]> {
+    const functionsMap: Map<string, { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number }> = new Map();
     const functionPattern = new RegExp(`(async\\s+)?def\\s+(${type})(\\w*)`, 'g');
 
     let i = 0;
@@ -169,24 +183,32 @@ async function getFunctionsData(documents: vscode.TextDocument[], type: string, 
                 const fullFunction = normalizeIndent(document.getText(functionRange), 4);
 
                 if (!functionsMap.has(fullFunction)) {
+                    const filePath = document.uri.fsPath;
+
                     functionsMap.set(fullFunction, {
                         name: functionName,
                         nameRange: functionNameRange,
                         functionRange: functionRange,
                         fullFunction: fullFunction,
-                        id: i
+                        id: i,
+                        filePath: filePath,
+                        usageCount: 1
                     });
                     i++;
+                } else {
+                    const existingFunction = functionsMap.get(fullFunction);
+                    if (existingFunction) {
+                        existingFunction.usageCount++;
+                    }
                 }
             }
         }
     }
 
-    // Convert Map values to an array
     return Array.from(functionsMap.values());
 }
 
-async function filterFunctionsData(functionsData: { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number}[], filterName: string = ""): Promise<{ name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number}[]> {
+async function filterFunctionsData(functionsData: { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number}[], filterName: string = ""): Promise<{ name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number}[]> {
     if (filterName === "") {
         return functionsData;
     }
@@ -302,24 +324,34 @@ async function replaceFunction(document: vscode.TextDocument, originalRange: vsc
     });
 }
 
-async function getWebviewContent(foundFunctionsData: { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number }[], selectedFunctionName: string, functionToReplaceNameRange: vscode.Range, panel: vscode.WebviewPanel, context: vscode.ExtensionContext): Promise<string> {
+async function getWebviewContent(foundFunctionsData: { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number }[], selectedFunctionName: string, functionToReplaceNameRange: vscode.Range, panel: vscode.WebviewPanel, context: vscode.ExtensionContext): Promise<string> {
 
     const stylePath = path.join(context.extensionPath, 'node_modules', 'highlight.js', 'styles', 'atom-one-dark.css');
     const styleUri = panel.webview.asWebviewUri(vscode.Uri.file(stylePath));
 
-    const functionList = Array.from(foundFunctionsData).map(f => {
+    // Сортируем шаги по количеству использований
+    foundFunctionsData.sort((a, b) => b.usageCount - a.usageCount);
+
+    const functionList = foundFunctionsData.map(f => {
         const functionText = f.fullFunction;
         const code = hljs.highlight('python', functionText).value;
         if (!rangesAreEqual(f.nameRange, functionToReplaceNameRange)) {
             return `
                 <div class="function-item" data-function-name="${f.name}" data-function-text="${functionText}">
-                    <button onclick="replace(${f.id}, '${f.name}')"> Replace</button> with <h4>${f.name}</h4>
+                    <button onclick="replace(${f.id}, '${f.name}')"> Replace</button>
+                    with
+                    <!-- Название функции, кликабельно и отображает количество использований при наведении -->
+                    <h4>
+                        <a href="#" title="Usage count: ${f.usageCount}"
+                           onclick="openFile('${f.filePath}', ${f.functionRange.start.line}, ${f.functionRange.start.character})">
+                            ${f.name}
+                        </a>
+                    </h4>
                     <pre><code class="javascript fullWidth">${code}</code></pre>
                 </div>
             `;
         }
     }).join('');
-
 
     return `
     <!DOCTYPE html>
@@ -356,6 +388,15 @@ async function getWebviewContent(foundFunctionsData: { name: string, nameRange: 
                 margin: 0;
                 font-size: 16px;
                 display: inline-block;
+            }
+            /* Всегда отображаем ссылки со стилем подчеркивания и цветом */
+            a {
+                text-decoration: underline;
+                color: var(--vscode-textLink-foreground, #3794ff);
+            }
+            a:hover {
+                text-decoration: underline;
+                color: var(--vscode-textLink-activeForeground, #0066cc);
             }
             p {
                 margin: 5px 0;
@@ -397,6 +438,17 @@ async function getWebviewContent(foundFunctionsData: { name: string, nameRange: 
                     } else {
                         item.style.display = 'none';
                     }
+                });
+            }
+
+            // Функция для открытия файла в VS Code
+            // Теперь передаем и строку, и символ для перехода к точной позиции
+            function openFile(filePath, line, character) {
+                vscode.postMessage({
+                    command: 'openFile',
+                    filePath: filePath,
+                    line: line,
+                    character: character
                 });
             }
         </script>
