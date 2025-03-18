@@ -26,6 +26,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('extension.showFunctionListWebview', async (documentUri: vscode.Uri, functionToReplaceNameRange: vscode.Range, type: string, functionToReplaceName: string, needFilter: boolean) => {
             let foundFunctionsData: { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number}[] = [];
+
             if (!cacheFunctionsData.has(type)) {
                 const documents = await openPythonDocuments();
                 foundFunctionsData = await getFunctionsData(documents, type);
@@ -39,7 +40,11 @@ export function activate(context: vscode.ExtensionContext) {
             }
 
             const document = await vscode.workspace.openTextDocument(documentUri);
-            const currentFileFunctionsData = await getFunctionsData([document], type);
+            // let currentFileFunctionsData = await getFunctionsData([document], type);
+
+            context.globalState.update('currentType', type);
+            context.globalState.update('lastSelectedFunctionName', type + functionToReplaceName);
+            context.globalState.update('currentFoundFunctionsData', foundFunctionsData);
 
             if (!panel) {
                 panel = vscode.window.createWebviewPanel(
@@ -60,7 +65,7 @@ export function activate(context: vscode.ExtensionContext) {
 
             const fullFunctionToReplaceName = type + functionToReplaceName;
             panel.webview.html = await getWebviewContent(foundFunctionsData, fullFunctionToReplaceName, functionToReplaceNameRange,
-                panel, context
+                panel, context, 'replace'
             );
 
             // Dispose the old message listener if it exists
@@ -71,12 +76,37 @@ export function activate(context: vscode.ExtensionContext) {
             messageListenerDisposable = panel.webview.onDidReceiveMessage(
                 async message => {
                     if (message.command === 'replace') {
-                        console.log(`Received replace command, selected function is ${message.functionName}`);
-                        const selectedFunction = foundFunctionsData.find(f => f.id === message.functionID);
-                        if (selectedFunction != undefined) {
-                            const functionToReplaceRange = currentFileFunctionsData.find(f => rangesAreEqual(f.nameRange, functionToReplaceNameRange))?.functionRange;
-                            await replaceFunction(document, functionToReplaceRange, selectedFunction.fullFunction);
+                        const currentType: string | undefined = context.globalState.get('currentType');
+                        if (currentType === undefined) {
+                            throw new Error("Current type is undefined, can't replace function");
                         }
+
+                        const currentFoundFunctionsData: { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number}[] | undefined = context.globalState.get('currentFoundFunctionsData');
+                        if (currentFoundFunctionsData === undefined) {
+                            throw new Error("Found functions data is undefined, can't replace function");
+                        }
+
+                        const selectedFunction = currentFoundFunctionsData.find(f => f.id === message.functionID);
+                        if (selectedFunction === undefined) {
+                            throw new Error("Selected function is undefined, can't replace function");
+                        }
+
+                        let fileFunctionsData = await getFunctionsData([document], currentType);
+
+                        let lastSelectedFunctionName: string | undefined = context.globalState.get('lastSelectedFunctionName');
+                        if (lastSelectedFunctionName === undefined) {
+                            throw new Error("Last selected function name is undefined, can't replace function");
+                        }
+
+                        let functionToReplaceNameRange = fileFunctionsData.find(f => f.name === lastSelectedFunctionName)?.nameRange;
+                        if (functionToReplaceNameRange === undefined) {
+                            throw new Error("Function to replace name range is undefined, can't replace function");
+                        }
+
+                        const functionToReplaceRange = fileFunctionsData.find(f => rangesAreEqual(f.nameRange, functionToReplaceNameRange))?.functionRange;
+                        await replaceFunction(document, functionToReplaceRange, selectedFunction.fullFunction);
+                        context.globalState.update('lastSelectedFunctionName', selectedFunction.name);
+
                     } else if (message.command === 'openFile') {
                         // Открытие файла и прокрутка до указанной строки и символа
                         const fileUri = vscode.Uri.file(message.filePath);
@@ -98,6 +128,76 @@ export function activate(context: vscode.ExtensionContext) {
             );
         })
     );
+
+    vscode.commands.registerCommand('extension.constructTest', async (documentUri: vscode.Uri, range: vscode.Range, className: string) => {
+        let foundFunctionsData: { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number}[] = [];
+
+        // Получаем все функции без фильтрации по типам
+        if (!cacheFunctionsData.has('scenario')) {
+            const documents = await openPythonDocuments();
+            foundFunctionsData = await getFunctionsData(documents, '');
+            cacheFunctionsData.set('scenario', foundFunctionsData);
+        } else {
+            foundFunctionsData = cacheFunctionsData.get('scenario') || [];
+        }
+
+        context.globalState.update('currentFoundFunctionsData', foundFunctionsData);
+
+        const document = await vscode.workspace.openTextDocument(documentUri);
+
+        if (!panel) {
+            panel = vscode.window.createWebviewPanel(
+                'functionList',
+                'Select Function',
+                vscode.ViewColumn.Beside, // Открываем в режиме разделенного экрана
+                { enableScripts: true }
+            );
+
+            panel.onDidDispose(
+                () => {
+                    panel = undefined;
+                },
+                null,
+                context.subscriptions
+            );
+        }
+
+        panel.webview.html = await getWebviewContent(foundFunctionsData, className, range, panel, context, 'append');
+
+        // Обработчик для команды "Append"
+        messageListenerDisposable = panel.webview.onDidReceiveMessage(
+            async message => {
+                if (message.command === 'append') {
+                    const currentFoundFunctionsData: { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number}[] | undefined = context.globalState.get('currentFoundFunctionsData');
+                    if (currentFoundFunctionsData === undefined) {
+                        throw new Error("Found functions data is undefined, can't replace function");
+                    }
+
+                    const selectedFunction = currentFoundFunctionsData.find(f => f.id === message.functionID);
+                    if (selectedFunction != undefined) {
+                        // Вставляем функцию в конец файла
+                        await appendFunctionToEnd(document, selectedFunction.fullFunction);
+                    }
+                } else if (message.command === 'openFile') {
+                    // Открытие файла и прокрутка до указанной строки и символа
+                    const fileUri = vscode.Uri.file(message.filePath);
+                    const document = await vscode.workspace.openTextDocument(fileUri);
+                    const editor = await vscode.window.showTextDocument(document);
+
+                    // Используем точную позицию строки и символа
+                    const position = new vscode.Position(message.line, message.character);
+
+                    // Устанавливаем курсор на нужную позицию
+                    editor.selection = new vscode.Selection(position, position);
+
+                    // Прокручиваем до позиции, если она не видна
+                    editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
+                }
+            },
+            undefined,
+            context.subscriptions
+        );
+    });
 }
 
 class FunctionCodeLensProvider implements vscode.CodeLensProvider {
@@ -110,9 +210,6 @@ class FunctionCodeLensProvider implements vscode.CodeLensProvider {
             let match;
 
             while (match = functionPattern.exec(text)) {
-                console.log(`Found function: ${match[0]}`);
-                console.log(`Type: ${match[2]}`);
-
                 const type = match[2];
                 const functionName = match[3];
 
@@ -129,6 +226,25 @@ class FunctionCodeLensProvider implements vscode.CodeLensProvider {
                     title: `Search similar ${type}`,
                     command: 'extension.showFunctionListWebview',
                     arguments: [document.uri, functionNameRange, type, functionName, true]
+                }));
+            }
+
+            // Шаблон для поиска классов сценариев
+            const classPattern = new RegExp(`class\\s+(\\w+)\\(vedro\\.Scenario\\):`, 'g');
+            let classMatch;
+
+            // Добавляем CodeLens для классов сценариев
+            while (classMatch = classPattern.exec(text)) {
+                const className = classMatch[1];
+                const startPos = document.positionAt(classMatch.index);
+                const endPos = document.positionAt(classMatch.index + classMatch[0].length);
+                const classNameRange = new vscode.Range(startPos, endPos);
+
+                // Добавляем CodeLens для "Construct test"
+                codeLenses.push(new vscode.CodeLens(classNameRange, {
+                    title: `Append to scenario`,
+                    command: 'extension.constructTest',
+                    arguments: [document.uri, classNameRange, className]
                 }));
             }
         }
@@ -324,7 +440,30 @@ async function replaceFunction(document: vscode.TextDocument, originalRange: vsc
     });
 }
 
-async function getWebviewContent(foundFunctionsData: { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number }[], selectedFunctionName: string, functionToReplaceNameRange: vscode.Range, panel: vscode.WebviewPanel, context: vscode.ExtensionContext): Promise<string> {
+async function appendFunctionToEnd(document: vscode.TextDocument, functionText: string) {
+    let editor = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === document.uri.toString());
+
+    // Если редактор не найден, открываем документ
+    if (!editor) {
+        editor = await vscode.window.showTextDocument(document, { preserveFocus: false });
+    }
+
+    const lastLine = document.lineCount - 1;
+    const lastLineRange = new vscode.Position(lastLine, document.lineAt(lastLine).text.length);
+
+    // Разбиваем функцию на строки
+    const lines = functionText.split('\n');
+
+    // Добавляем отступ в 4 пробела для каждой строки, но не берем последнюю строку
+    let indentedFunctionText = lines.slice(0, -1).map(line => '    ' + line).join('\n');
+
+    await editor.edit(editBuilder => {
+        // Вставляем функцию с одной пустой строкой перед ней
+        editBuilder.insert(lastLineRange, '\n' + indentedFunctionText + '\n');
+    });
+}
+
+async function getWebviewContent(foundFunctionsData: { name: string, nameRange: vscode.Range, functionRange: vscode.Range, fullFunction: string, id: number, filePath: string, usageCount: number }[], selectedFunctionName: string, functionToReplaceNameRange: vscode.Range, panel: vscode.WebviewPanel, context: vscode.ExtensionContext, buttonLabel: string): Promise<string> {
 
     const stylePath = path.join(context.extensionPath, 'node_modules', 'highlight.js', 'styles', 'atom-one-dark.css');
     const styleUri = panel.webview.asWebviewUri(vscode.Uri.file(stylePath));
@@ -332,13 +471,15 @@ async function getWebviewContent(foundFunctionsData: { name: string, nameRange: 
     // Сортируем шаги по количеству использований
     foundFunctionsData.sort((a, b) => b.usageCount - a.usageCount);
 
+    let header = buttonLabel === 'append' ? "Appending to" : "Replacing";
+
     const functionList = foundFunctionsData.map(f => {
         const functionText = f.fullFunction;
         const code = hljs.highlight('python', functionText).value;
         if (!rangesAreEqual(f.nameRange, functionToReplaceNameRange)) {
             return `
                 <div class="function-item" data-function-name="${f.name}" data-function-text="${functionText}">
-                    <button onclick="replace(${f.id}, '${f.name}')"> Replace</button>
+                    <button onclick="replace(${f.id}, '${f.name}')"> ${buttonLabel}</button>
                     with
                     <!-- Название функции, кликабельно и отображает количество использований при наведении -->
                     <h4>
@@ -410,7 +551,7 @@ async function getWebviewContent(foundFunctionsData: { name: string, nameRange: 
     </head>
     <body>
         <div class="header">
-            <p>Replacing <b>${selectedFunctionName}</b></p>
+            <p>${header} <b>${selectedFunctionName}</b></p>
             <input type="text" id="search" placeholder="Search functions..." oninput="filterFunctions()">
         </div>
         ${functionList}
@@ -420,7 +561,7 @@ async function getWebviewContent(foundFunctionsData: { name: string, nameRange: 
 
             function replace(functionID, functionName) {
                 vscode.postMessage({
-                    command: 'replace',
+                    command: '${buttonLabel}',
                     functionID: functionID,
                     functionName: functionName
                 });

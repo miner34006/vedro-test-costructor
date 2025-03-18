@@ -3,7 +3,7 @@
   "publisher": "bpolianok",
   "displayName": "vedro-test-constructor",
   "description": "VSCode extention for Vedro framework to construct tests from already available steps",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "engines": {
     "vscode": "^1.92.0"
   },
